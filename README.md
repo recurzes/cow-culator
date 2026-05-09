@@ -79,7 +79,10 @@ flowchart TD
   extractedJpegs --> annotationsImages[annotations/**/images/]
 
   cvatXml[CVAT_export_annotations.xml] -->|cowculator_xml_to_yolo| yoloLabels[yolo_labels/*.txt]
-  annotationsImages -->|cowculator_prepare| yoloDataset[yolo_dataset/\nimages/{train,val}\nlabels/{train,val}\ndataset.yaml]
+  
+  %% The fix is on the line below: wrap the text in quotes and use <br> for line breaks
+  annotationsImages -->|cowculator_prepare| yoloDataset["yolo_dataset/<br>images/{train,val}<br>labels/{train,val}<br>dataset.yaml"]
+  
   yoloLabels -->|cowculator_prepare| yoloDataset
 
   yoloDataset -->|cowculator_train| runsPose[runs/pose/.../weights/best.pt]
