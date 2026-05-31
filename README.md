@@ -211,12 +211,44 @@ Key options:
 | `--layers N` | 2 | Number of GRU layers |
 | `--dropout F` | 0.3 | Dropout probability |
 | `--regression` | off | Use MSE regression instead of 5-class softmax |
+| `--use-features` | off | Append derived gait features to the keypoint vector (see below) |
+| `--normalize` | off | Apply per-sequence z-score normalization before flattening |
 | `--lr F` | 1e-3 | AdamW learning rate |
 | `--batch-size N` | 16 | Batch size |
 | `--device D` | auto | GPU index or `cpu` |
 | `--workers N` | 0 | DataLoader workers (0 is safe on Windows) |
 
 Checkpoints are saved to `runs/lameness/expN/weights/best.pt`.
+
+#### Derived gait features (`--use-features`)
+
+When `--use-features` is set, the model's input is extended with 5 biomechanical
+features computed per frame from the keypoint array:
+
+| Feature | Description |
+|---------|-------------|
+| Spine angle | Angle of the neck → tail-head vector (overall back inclination) |
+| Spine curvature | Mean angular deviation along the spine chain (arched-back indicator) |
+| Hip drop | Vertical asymmetry between left and right hip keypoints |
+| Hoof x-range | Horizontal spread of all hoof/ankle keypoints (stride proxy) |
+| Mean confidence | Average keypoint detection confidence (quality gate) |
+
+The input size grows from `K×3` to `K×3 + 5`. The features use a 7-keypoint
+default skeleton layout (head, neck, withers, mid-back, loin, tail-head,
+rear-hoof). For 10-keypoint annotations the extended layout (4 hooves) is
+selected automatically based on `K`.
+
+Recommended for most training runs when enough annotated sequences are available:
+
+```bash
+cowculator train-lameness -- --csv data/lameness_labels.csv --use-features --normalize --epochs 100
+```
+
+#### Per-sequence normalization (`--normalize`)
+
+Z-score normalization is applied per sequence across the temporal dimension
+before flattening. This removes cow-size and camera-placement bias, making
+training more stable when data comes from multiple sessions or distances.
 
 ### Step 4 — Infer on new sequences
 
@@ -234,6 +266,105 @@ Output CSV columns: `sequence_path, predicted_score, confidence`.
 
 `confidence` is the softmax probability of the top class (classification mode)
 or `NaN` in regression mode.
+
+---
+
+## Body Condition Scoring (BCS)
+
+BCS estimation uses back-view cow crops and an EfficientNet-B0 CNN to output
+a score on the [Edmonson scale](https://extension.psu.edu/body-condition-scoring-dairy-cows)
+(1.0 = emaciated → 5.0 = obese, in 0.25-step increments).
+
+### Step 1 — Select back-view frames
+
+After running `pose-track --save-crops`, select the best back-view frames per cow:
+
+```bash
+cowculator select-bcs-frames -- --crops-dir data/tracked_cows/ --out data/bcs_frames/
+```
+
+### Step 2 — Label frames (veterinarian assessment)
+
+Create a CSV with one row per image:
+
+```csv
+image_path,bcs_score
+data/bcs_frames/cow_1_frame_420.jpg,2.75
+data/bcs_frames/cow_2_frame_310.jpg,3.50
+```
+
+### Step 3 — Train the BCS model
+
+```bash
+cowculator train-bcs -- --csv data/bcs_labels.csv --epochs 100
+```
+
+Key options:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--loss-mode MODE` | `mse` | Loss function: `mse`, `ce`, or `ordinal` (see below) |
+| `--warmup-epochs N` | 0 | Epochs to train head-only before unfreezing backbone |
+| `--freeze-backbone` | off | Keep backbone frozen for the entire run |
+| `--lr F` | 1e-4 | AdamW learning rate (head); backbone gets `lr × 0.1` when unfrozen |
+| `--epochs N` | 100 | Training epochs |
+| `--batch-size N` | 16 | Batch size |
+| `--device D` | auto | GPU index or `cpu` |
+| `--workers N` | 0 | DataLoader workers |
+
+Checkpoints are saved to `runs/bcs/expN/weights/best.pt`.
+
+#### Loss modes (`--loss-mode`)
+
+| Mode | Head output | Loss | When to use |
+|------|-------------|------|-------------|
+| `mse` (default) | 1 neuron | MSELoss | Quick baseline; continuous regression |
+| `ce` | 17 neurons | CrossEntropyLoss | Treats each 0.25-step bin as a class |
+| `ordinal` | 16 neurons | BCEWithLogitsLoss | Cumulative encoding; best respects the ordinal scale |
+
+Recommended for most training runs:
+
+```bash
+cowculator train-bcs -- --csv data/bcs_labels.csv --loss-mode ordinal --warmup-epochs 10 --epochs 100
+```
+
+#### Two-stage backbone fine-tuning (`--warmup-epochs`)
+
+`--warmup-epochs N` trains only the classifier head for the first N epochs,
+then automatically unfreezes the EfficientNet-B0 backbone with a 10× lower
+learning rate. This prevents the pretrained features from being destroyed by
+large gradient updates in early training, which is especially important with
+small farm datasets.
+
+```bash
+# 10 epochs head-only, then full fine-tune for remaining 90
+cowculator train-bcs -- --csv data/bcs_labels.csv --warmup-epochs 10 --epochs 100
+```
+
+### Step 4 — Infer on back-view images
+
+```bash
+cowculator infer-bcs -- --images data/bcs_frames/ --out results/bcs_predictions.csv
+```
+
+Per-image output CSV columns: `image_path, cow_id, bcs_score, bcs_rounded`.
+
+#### Multi-frame aggregation (`--aggregate`)
+
+When multiple frames per cow are available (from `select-bcs-frames`), use
+`--aggregate` to collapse per-frame scores into a single score per cow:
+
+```bash
+# Mean across all frames for each cow_id
+cowculator infer-bcs -- --images data/bcs_frames/ --aggregate mean --out results/bcs_predictions.csv
+
+# Median (more robust to outlier frames)
+cowculator infer-bcs -- --images data/bcs_frames/ --aggregate median --out results/bcs_predictions.csv
+```
+
+`cow_id` is parsed from filenames matching the `cow_N_frame_M.jpg` pattern
+produced by `select-bcs-frames`. Frames with no parseable `cow_id` are kept
+as individual rows.
 
 ## Troubleshooting
 
