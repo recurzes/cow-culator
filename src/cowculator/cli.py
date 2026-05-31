@@ -93,6 +93,18 @@ def _cmd_infer_bcs(args: argparse.Namespace) -> None:
     ib_main(_passthrough_argv(list(args.remainder)))
 
 
+def _cmd_train_lameness(args: argparse.Namespace) -> None:
+    from cowculator.train_lameness import main as tl_main
+
+    tl_main(_passthrough_argv(list(args.remainder)))
+
+
+def _cmd_infer_lameness(args: argparse.Namespace) -> None:
+    from cowculator.infer_lameness import main as il_main
+
+    il_main(_passthrough_argv(list(args.remainder)))
+
+
 def _cmd_doctor(_: argparse.Namespace) -> None:
     root = repo_root()
     ds = root / "yolo_dataset" / "dataset.yaml"
@@ -197,6 +209,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="Arguments for infer_bcs (e.g. --images data/bcs_frames/ --out results.csv)",
     )
     s.set_defaults(_handler=_cmd_infer_bcs)
+
+    s = sub.add_parser(
+        "train-lameness",
+        help="Train bidirectional GRU lameness classifier on pose sequences (pass-through args)",
+    )
+    s.add_argument(
+        "remainder",
+        nargs=argparse.REMAINDER,
+        help=(
+            "Arguments for train_lameness "
+            "(e.g. --csv data/lameness_labels.csv --epochs 100 --seq-len 60)"
+        ),
+    )
+    s.set_defaults(_handler=_cmd_train_lameness)
+
+    s = sub.add_parser(
+        "infer-lameness",
+        help="Predict lameness scores from .npy pose sequences (pass-through args)",
+    )
+    s.add_argument(
+        "remainder",
+        nargs=argparse.REMAINDER,
+        help=(
+            "Arguments for infer_lameness "
+            "(e.g. --sequences-dir data/pose_sequences/ --out results/lameness.csv)"
+        ),
+    )
+    s.set_defaults(_handler=_cmd_infer_lameness)
 
     s = sub.add_parser("doctor", help="Print resolved default paths and env")
     s.set_defaults(_handler=_cmd_doctor)
