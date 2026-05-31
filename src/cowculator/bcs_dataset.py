@@ -29,6 +29,20 @@ INPUT_SIZE = 224
 BCS_MIN = 1.0
 BCS_MAX = 5.0
 
+# Edmonson scale: 1.0, 1.25, 1.5, …, 5.0  → 17 discrete bins
+BCS_STEP = 0.25
+BCS_NUM_BINS: int = round((BCS_MAX - BCS_MIN) / BCS_STEP) + 1  # 17
+
+
+def bcs_to_bin(score: float) -> int:
+    """Map a BCS score to a 0-based bin index.  1.0 → 0, 5.0 → 16."""
+    return round((score - BCS_MIN) / BCS_STEP)
+
+
+def bin_to_bcs(bin_idx: int) -> float:
+    """Map a 0-based bin index back to a BCS score.  0 → 1.0, 16 → 5.0."""
+    return round(BCS_MIN + bin_idx * BCS_STEP, 2)
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Transforms
 # ──────────────────────────────────────────────────────────────────────────────
