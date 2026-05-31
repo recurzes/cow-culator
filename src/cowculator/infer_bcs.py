@@ -26,8 +26,8 @@ from pathlib import Path
 import torch
 from PIL import Image
 
-from cowculator.bcs_dataset import BCS_MAX, BCS_MIN, INPUT_SIZE, build_val_transform
-from cowculator.train_bcs import build_model
+from cowculator.bcs_dataset import BCS_MAX, BCS_MIN, BCS_NUM_BINS, INPUT_SIZE, build_val_transform
+from cowculator.train_bcs import build_model, _preds_to_scores
 from cowculator.paths import repo_root
 
 _IMG_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
@@ -64,15 +64,30 @@ def _default_bcs_checkpoint() -> Path | None:
     return max(candidates, key=lambda p: p.stat().st_mtime)
 
 
-def load_model(checkpoint_path: Path, device: torch.device) -> torch.nn.Module:
+def load_model(checkpoint_path: Path, device: torch.device) -> tuple[torch.nn.Module, str]:
+    """Load checkpoint; return (model, loss_mode).
+
+    Returns loss_mode so ``run_inference`` can decode outputs correctly.
+    """
     state = torch.load(checkpoint_path, map_location=device)
-    model = build_model(pretrained=False)
-    # Checkpoint may contain 'model_state_dict' (from train_bcs) or raw state dict
+    # Checkpoint may contain 'model_state_dict' (from train_bcs) or raw state dict.
+    # The 'config' key is informational; architecture is fixed as EfficientNet-B0.
+    cfg = state.get("config", {})
+    arch = cfg.get("arch", "efficientnet_b0")
+    if arch != "efficientnet_b0":
+        import warnings
+        warnings.warn(
+            f"Checkpoint config.arch={arch!r} — only 'efficientnet_b0' is supported; "
+            "loading anyway.",
+            stacklevel=2,
+        )
+    loss_mode: str = cfg.get("loss_mode", "mse")
+    model = build_model(pretrained=False, loss_mode=loss_mode)
     sd = state.get("model_state_dict", state)
     model.load_state_dict(sd)
     model.to(device)
     model.eval()
-    return model
+    return model, loss_mode
 
 
 @torch.no_grad()
@@ -81,6 +96,7 @@ def run_inference(
     images: list[Path],
     device: torch.device,
     batch_size: int = 16,
+    loss_mode: str = "mse",
 ) -> list[dict]:
     """
     Run inference in batches; return list of result dicts.
@@ -99,8 +115,8 @@ def run_inference(
                 tensors.append(torch.zeros(3, INPUT_SIZE, INPUT_SIZE))
 
         batch = torch.stack(tensors).to(device)
-        raw = model(batch).squeeze(1)
-        scores = torch.clamp(raw, BCS_MIN, BCS_MAX).cpu().tolist()
+        raw = model(batch)
+        scores = _preds_to_scores(raw, loss_mode).cpu().tolist()
 
         for path, score in zip(batch_paths, scores):
             results.append(
@@ -128,6 +144,55 @@ def write_csv(results: list[dict], out: Path | None) -> None:
             writer.writeheader()
             writer.writerows(results)
         print(f"Wrote {len(results)} predictions to {out}")
+
+
+def aggregate_by_cow(
+    results: list[dict],
+    method: str = "mean",
+) -> list[dict]:
+    """Group per-frame results by ``cow_id`` and reduce to one score per cow.
+
+    Parameters
+    ----------
+    results : Per-frame result dicts (image_path, cow_id, bcs_score, bcs_rounded).
+    method  : 'mean' or 'median'.  Applied to the continuous ``bcs_score``
+              values; the reduced score is then re-rounded to 0.25 steps.
+
+    Returns
+    -------
+    List of dicts with one entry per unique cow_id.  Rows whose ``cow_id``
+    is empty are kept as-is (no grouping possible).
+    """
+    import statistics
+
+    groups: dict[str, list[float]] = {}
+    ungrouped: list[dict] = []
+
+    for row in results:
+        cid = row.get("cow_id", "")
+        if not cid:
+            ungrouped.append(row)
+            continue
+        groups.setdefault(cid, []).append(float(row["bcs_score"]))
+
+    aggregated: list[dict] = []
+    for cid in sorted(groups):
+        scores = groups[cid]
+        if method == "median":
+            agg_score = statistics.median(scores)
+        else:
+            agg_score = sum(scores) / len(scores)
+        agg_score = max(BCS_MIN, min(BCS_MAX, agg_score))
+        aggregated.append(
+            {
+                "image_path": f"<aggregated {len(scores)} frames>",
+                "cow_id": cid,
+                "bcs_score": round(agg_score, 4),
+                "bcs_rounded": _round_bcs(agg_score),
+            }
+        )
+
+    return aggregated + ungrouped
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -162,6 +227,17 @@ def build_argparser() -> argparse.ArgumentParser:
         "--device",
         default=None,
         help="Device: cpu, cuda, 0, etc. (default: auto)",
+    )
+    p.add_argument(
+        "--aggregate",
+        choices=["mean", "median"],
+        default=None,
+        metavar="METHOD",
+        help=(
+            "Aggregate per-frame scores to one score per cow_id using "
+            "'mean' or 'median'.  Requires filenames to match the "
+            "cow_N_frame_M.jpg pattern produced by select-bcs-frames."
+        ),
     )
     return p
 
@@ -203,10 +279,15 @@ def main(argv: list[str] | None = None) -> None:
     print(f"Images : {len(images)}")
 
     # ── inference ─────────────────────────────────────────────────────────────
-    model = load_model(ckpt_path, device)
-    results = run_inference(model, images, device, batch_size=args.batch_size)
+    model, loss_mode = load_model(ckpt_path, device)
+    print(f"Loss mode : {loss_mode}")
+    results = run_inference(model, images, device, batch_size=args.batch_size,
+                            loss_mode=loss_mode)
 
     # ── output ────────────────────────────────────────────────────────────────
+    if args.aggregate:
+        results = aggregate_by_cow(results, method=args.aggregate)
+        print(f"Aggregated to {len(results)} cow-level scores (method={args.aggregate})")
     write_csv(results, args.out)
 
 
