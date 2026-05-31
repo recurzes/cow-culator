@@ -14,8 +14,16 @@ Two output modes are supported:
   - Classification (default): CrossEntropyLoss over 5 classes (1–5).
   - Regression (``--regression``): MSELoss, output clamped to [1.0, 5.0].
 
+Feature engineering:
+  Pass ``--use-features`` to append derived gait features (spine angle,
+  spine curvature, hip drop, hoof x-range, mean confidence) to the raw
+  keypoint vector.  The input size grows from K*3 to K*3+5.
+
+  Pass ``--normalize`` to apply per-sequence z-score normalization before
+  flattening, which stabilizes GRU training across different camera setups.
+
 Architecture:
-  BiGRU(input=K*3, hidden=128, layers=2, dropout=0.3, bidirectional=True)
+  BiGRU(input=K*3[+F], hidden=128, layers=2, dropout=0.3, bidirectional=True)
   └── Linear(256 → num_classes)   [classification]
       Linear(256 → 1)             [regression]
 
@@ -158,6 +166,8 @@ def train(
     workers: int = 0,
     device_str: str | None = None,
     regression: bool = False,
+    use_features: bool = False,
+    normalize: bool = False,
     runs_dir: Path | None = None,
 ) -> Path:
     """
@@ -178,6 +188,9 @@ def train(
     workers      : DataLoader worker processes (0 = main process; safe on Windows).
     device_str   : ``'cpu'``, ``'0'``, ``'cuda:0'``, etc. Auto-detected if None.
     regression   : Use MSE regression instead of cross-entropy classification.
+    use_features : Append derived gait features (spine angle, hip drop, etc.)
+                   to the raw keypoint vector.  Increases input size by 5.
+    normalize    : Apply per-sequence z-score normalization before flattening.
     runs_dir     : Parent of expN directories (default: <repo>/runs/lameness).
     """
     # ── device ────────────────────────────────────────────────────────────────
@@ -200,8 +213,17 @@ def train(
     print(f"Device         : {device}")
 
     # ── datasets ──────────────────────────────────────────────────────────────
-    train_ds = GaitSequenceDataset(csv_path, seq_len=seq_len, augment=True)
-    val_ds = GaitSequenceDataset(csv_path, seq_len=seq_len, augment=False)
+    from cowculator.gait_features import build_feature_fn, make_layout_from_k
+
+    # Build feature_fn lazily after we know K (from the first .npy file).
+    # We construct a temporary dataset just to read K, then rebuild properly.
+    _probe_ds = GaitSequenceDataset(csv_path, seq_len=seq_len)
+    feature_fn = build_feature_fn(make_layout_from_k(_probe_ds.num_keypoints)) if use_features else None
+
+    train_ds = GaitSequenceDataset(csv_path, seq_len=seq_len, augment=True,
+                                   normalize=normalize, feature_fn=feature_fn)
+    val_ds   = GaitSequenceDataset(csv_path, seq_len=seq_len, augment=False,
+                                   normalize=normalize, feature_fn=feature_fn)
 
     train_subset, _ = split_dataset(train_ds, val_fraction=val_fraction, seed=seed)
     _, val_subset_base = split_dataset(val_ds, val_fraction=val_fraction, seed=seed)
@@ -209,33 +231,15 @@ def train(
 
     train_indices: list[int] = train_subset.indices  # type: ignore[attr-defined]
 
-    # Weighted sampling for class imbalance
-    scores = train_ds.scores
-    class_counts: dict[int, int] = {}
-    for s in scores:
-        class_counts[s] = class_counts.get(s, 0) + 1
-    raw_weights = [1.0 / class_counts[s] for s in scores]
-    sub_weights = [raw_weights[i] for i in train_indices]
-    total = sum(sub_weights)
-    probs = torch.tensor([w / total for w in sub_weights])
-
-    class _IndexSampler(torch.utils.data.Sampler):
-        def __init__(self, indices: list[int], probs: torch.Tensor) -> None:
-            self._indices = indices
-            self._probs = probs
-
-        def __iter__(self):  # type: ignore[override]
-            gen = torch.multinomial(self._probs, num_samples=len(self._indices), replacement=True)
-            return iter(self._indices[i] for i in gen.tolist())
-
-        def __len__(self) -> int:
-            return len(self._indices)
-
-    train_base = GaitSequenceDataset(csv_path, seq_len=seq_len, augment=True)
+    # Weighted sampling for class imbalance — use utility from gait_dataset
+    train_base = GaitSequenceDataset(csv_path, seq_len=seq_len, augment=True,
+                                     normalize=normalize, feature_fn=feature_fn)
+    train_split = Subset(train_base, train_indices)
+    train_sampler = build_weighted_sampler(train_split)
     train_loader = DataLoader(
-        train_base,
+        train_split,
         batch_size=batch_size,
-        sampler=_IndexSampler(train_indices, probs),
+        sampler=train_sampler,
         num_workers=workers,
         pin_memory=(device.type == "cuda"),
     )
@@ -250,11 +254,14 @@ def train(
     n_train = len(train_indices)
     n_val = len(val_subset)
     input_size = train_ds.input_size
-    print(f"Input size     : {input_size} (K*3 = {train_ds.num_keypoints}×3)")
+    print(f"Input size     : {input_size} (K*3 = {train_ds.num_keypoints}×3"
+          + (f" + {input_size - train_ds.num_keypoints*3} derived features" if use_features else "")
+          + ")")
     print(f"Seq len        : {seq_len}")
     print(f"Train samples  : {n_train}  |  Val samples: {n_val}")
     print(f"Batch size     : {batch_size}  |  Epochs: {epochs}  |  LR: {lr}")
     print(f"Mode           : {'regression' if regression else 'classification'}")
+    print(f"Use features   : {use_features}  |  Normalize: {normalize}")
 
     # ── model ─────────────────────────────────────────────────────────────────
     model = LamenessGRU(
@@ -295,7 +302,7 @@ def train(
             optimizer.zero_grad()
             preds = model(seqs)
             if regression:
-                loss = criterion(preds, labels.float() + LAMENESS_MIN - 1)
+                loss = criterion(preds, labels.float() + LAMENESS_MIN)
             else:
                 loss = criterion(preds, labels)
             loss.backward()
@@ -366,6 +373,8 @@ def train(
                     "dropout": dropout,
                     "num_classes": NUM_CLASSES,
                     "regression": regression,
+                    "use_features": use_features,
+                    "normalize": normalize,
                 },
             },
             last_ckpt,
@@ -388,6 +397,8 @@ def train(
                         "dropout": dropout,
                         "num_classes": NUM_CLASSES,
                         "regression": regression,
+                        "use_features": use_features,
+                        "normalize": normalize,
                     },
                 },
                 best_ckpt,
@@ -439,6 +450,11 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Device: cpu, 0, cuda:0, etc.")
     p.add_argument("--regression", action="store_true",
                    help="Use MSE regression instead of cross-entropy classification")
+    p.add_argument("--use-features", action="store_true",
+                   help="Append derived gait features (spine angle, hip drop, hoof range, "
+                        "spine curvature, mean confidence) to the raw keypoint vector")
+    p.add_argument("--normalize", action="store_true",
+                   help="Apply per-sequence z-score normalization before flattening")
     p.add_argument("--runs-dir", type=Path, default=None,
                    help="Parent directory for experiment folders (default: runs/lameness/)")
     return p
@@ -461,6 +477,8 @@ def main(argv: list[str] | None = None) -> None:
             workers=args.workers,
             device_str=args.device,
             regression=args.regression,
+            use_features=args.use_features,
+            normalize=args.normalize,
             runs_dir=args.runs_dir,
         )
     except (ValueError, FileNotFoundError) as e:
