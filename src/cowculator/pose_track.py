@@ -137,8 +137,10 @@ def collect_poses_for_frame(
     """Append per-keypoint data for each tracked cow to ``pose_buffer``.
 
     Each entry in ``pose_buffer[track_id]`` is a float32 array of shape
-    ``[K, 3]`` (normalised x, y, confidence).  Missing/untracked detections
-    are skipped so buffer entries may be shorter than the total frame count.
+    ``[K, 3]`` (normalised x, normalised y, confidence).  Values are
+    normalised to [0, 1] so that downstream augmentations (e.g. horizontal
+    flip: ``x → 1 - x``) and z-score normalisation are well-conditioned.
+    Missing/untracked detections are skipped.
     """
     r0 = results[0]
     boxes = r0.boxes
@@ -146,8 +148,11 @@ def collect_poses_for_frame(
     if boxes is None or kps is None or len(boxes) == 0 or boxes.id is None:
         return
 
-    # kps.data shape: [N, K, 3]
-    kp_data = kps.data.cpu().numpy()  # float32
+    # kps.xyn: [N, K, 2] normalised (x, y) in [0, 1]
+    # kps.data: [N, K, 3] raw — use only the confidence channel (index 2)
+    xy_norm = kps.xyn.cpu().numpy().astype(np.float32)          # [N, K, 2]
+    conf = kps.data.cpu().numpy()[:, :, 2:].astype(np.float32)  # [N, K, 1]
+    kp_data = np.concatenate([xy_norm, conf], axis=2)           # [N, K, 3]
 
     for i, track_id_tensor in enumerate(boxes.id):
         if track_id_tensor is None:
