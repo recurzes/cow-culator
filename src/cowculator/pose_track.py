@@ -9,13 +9,17 @@ Class indices:
   not be "cow" on those weights.
 
 Cropping (``--save-crops``) is optional; the default path is visualize + track only.
+Pose sequences (``--save-poses``) saves per-track keypoint arrays as
+``data/pose_sequences/cow_{id}.npy`` of shape ``[T, K, 3]`` (x, y, conf).
 ``tools/legacy/cow_tracker.py`` remains the legacy box-only + always-on crop flow.
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
+from collections import defaultdict
 from typing import Any
 
 import cv2
@@ -28,6 +32,7 @@ VIDEO_PATH: str | None = None
 
 DEFAULT_OUT_DIR = "outputs/tracked_videos"
 CROP_BASE_DIR = "data/tracked_cows"
+POSES_BASE_DIR = "data/pose_sequences"
 PADDING = 0.10
 
 
@@ -125,6 +130,59 @@ def save_crops_for_frame(
             cv2.imwrite(out_path, crop)
 
 
+def collect_poses_for_frame(
+    results: Any,
+    pose_buffer: dict[int, list[np.ndarray]],
+) -> None:
+    """Append per-keypoint data for each tracked cow to ``pose_buffer``.
+
+    Each entry in ``pose_buffer[track_id]`` is a float32 array of shape
+    ``[K, 3]`` (normalised x, y, confidence).  Missing/untracked detections
+    are skipped so buffer entries may be shorter than the total frame count.
+    """
+    r0 = results[0]
+    boxes = r0.boxes
+    kps = r0.keypoints
+    if boxes is None or kps is None or len(boxes) == 0 or boxes.id is None:
+        return
+
+    # kps.data shape: [N, K, 3]
+    kp_data = kps.data.cpu().numpy()  # float32
+
+    for i, track_id_tensor in enumerate(boxes.id):
+        if track_id_tensor is None:
+            continue
+        try:
+            tid = int(track_id_tensor)
+        except (TypeError, ValueError):
+            continue
+        if i >= len(kp_data):
+            continue
+        pose_buffer[tid].append(kp_data[i])  # [K, 3]
+
+
+def save_pose_sequences(
+    pose_buffer: dict[int, list[np.ndarray]],
+    poses_dir: str,
+) -> None:
+    """Flush ``pose_buffer`` to ``.npy`` files under ``poses_dir``.
+
+    Each file is ``cow_{id}.npy`` with shape ``[T, K, 3]``.
+    Existing files for the same track ID are overwritten.
+    """
+    os.makedirs(poses_dir, exist_ok=True)
+    for tid, frames in pose_buffer.items():
+        if not frames:
+            continue
+        arr = np.stack(frames, axis=0).astype(np.float32)  # [T, K, 3]
+        out_path = os.path.join(poses_dir, f"cow_{tid}.npy")
+        np.save(out_path, arr)
+    if pose_buffer:
+        print(
+            f"Saved pose sequences for {len(pose_buffer)} tracks to {poses_dir}"
+        )
+
+
 def _resolve_model_path(explicit: str | None) -> str:
     if explicit:
         return explicit
@@ -187,6 +245,19 @@ def build_argparser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Save crops every N frames; default: ~2 crops/sec from FPS.",
+    )
+    p.add_argument(
+        "--save-poses",
+        action="store_true",
+        help=(
+            f"Save per-track keypoint sequences to {POSES_BASE_DIR}/cow_{{id}}.npy "
+            "as float32 arrays of shape [T, K, 3] (x, y, conf)."
+        ),
+    )
+    p.add_argument(
+        "--poses-dir",
+        default=str(root / POSES_BASE_DIR),
+        help="Output directory for .npy pose sequences when --save-poses.",
     )
     p.add_argument(
         "--no-show",
@@ -280,6 +351,8 @@ def main(argv: list[str] | None = None) -> None:
     if args.save_crops:
         os.makedirs(args.crop_dir, exist_ok=True)
 
+    pose_buffer: dict[int, list[np.ndarray]] = defaultdict(list)
+
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
@@ -313,6 +386,9 @@ def main(argv: list[str] | None = None) -> None:
                 args.crop_dir,
             )
 
+        if args.save_poses:
+            collect_poses_for_frame(results, pose_buffer)
+
         frame_id += 1
 
     cap.release()
@@ -320,6 +396,10 @@ def main(argv: list[str] | None = None) -> None:
         writer.release()
     if not args.no_show:
         cv2.destroyAllWindows()
+
+    if args.save_poses:
+        save_pose_sequences(pose_buffer, args.poses_dir)
+
     print(f"Done. Wrote {out_path} ({frame_id} frames).")
 
 
