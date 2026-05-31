@@ -80,7 +80,6 @@ flowchart TD
 
   cvatXml[CVAT_export_annotations.xml] -->|cowculator_xml_to_yolo| yoloLabels[yolo_labels/*.txt]
   
-  %% The fix is on the line below: wrap the text in quotes and use <br> for line breaks
   annotationsImages -->|cowculator_prepare| yoloDataset["yolo_dataset/<br>images/{train,val}<br>labels/{train,val}<br>dataset.yaml"]
   
   yoloLabels -->|cowculator_prepare| yoloDataset
@@ -88,11 +87,16 @@ flowchart TD
   yoloDataset -->|cowculator_train| runsPose[runs/pose/.../weights/best.pt]
 
   videoMp4[input_video.mp4] -->|cowculator_pose_track| trackedMp4[outputs/tracked_videos/*_pose_tracked.mp4]
-  videoMp4 -->|pose_track_--save-crops| crops[data/tracked_cows/cow_*/frame_*.jpg]
+  videoMp4 -->|"pose_track --save-crops"| crops[data/tracked_cows/cow_*/frame_*.jpg]
+  videoMp4 -->|"pose_track --save-poses"| poseSeqs["data/pose_sequences/cow_{id}.npy"]
 
   crops -->|cowculator_pseudo_label| pseudoLabels[YOLO_pose_labels_*.txt]
   crops -->|cowculator_yolo_to_coco| cocoJson[person_keypoints_coco.json_or_zip]
   pseudoLabels -->|cowculator_yolo_to_coco| cocoJson
+
+  poseSeqs --> lamenessCSV["lameness_labels.csv<br>sequence_path, lameness_score"]
+  lamenessCSV -->|cowculator_train_lameness| runsLameness[runs/lameness/expN/weights/best.pt]
+  runsLameness -->|cowculator_infer_lameness| lamenessResults[results/lameness.csv]
 ```
 
 ## Video pose tracking (inference) + optional crops
@@ -147,6 +151,89 @@ Optionally create a CVAT-friendly zip (`annotations/person_keypoints_<subset>.js
 ```bash
 cowculator yolo-to-coco -- --images-root ./data/tracked_cows --zip --subset default
 ```
+
+## Lameness Detection
+
+Lameness detection uses per-track pose keypoint sequences and a bidirectional
+GRU classifier to output a [Sprecher locomotion score](https://en.wikipedia.org/wiki/Lameness_(equine)#Scoring)
+(1 = normal, 5 = severely lame).
+
+### Step 1 — Collect pose sequences from side-view video
+
+Run `pose-track` with `--save-poses` to persist per-track keypoint arrays:
+
+```bash
+cowculator pose-track -- --video ./path/to/side_view.mp4 --save-poses
+```
+
+Each tracked cow produces `data/pose_sequences/cow_{id}.npy` — a float32
+array of shape `[T, K, 3]` (T frames × K keypoints × {normalised x, y, confidence}).
+
+Optionally specify a custom output directory:
+
+```bash
+cowculator pose-track -- --video ./path/to/side_view.mp4 --save-poses --poses-dir ./my_sequences
+```
+
+### Step 2 — Label sequences (veterinarian assessment)
+
+Create a CSV following the Sprecher locomotion scale:
+
+| Score | Description |
+|-------|-------------|
+| 1 | Normal — stands and walks with flat back |
+| 2 | Mildly lame — flat back while walking |
+| 3 | Moderately lame — arched back while walking |
+| 4 | Lame — arched back always, one limb favoured |
+| 5 | Severely lame — unable to bear weight on one limb |
+
+```csv
+sequence_path,lameness_score
+data/pose_sequences/cow_1.npy,1
+data/pose_sequences/cow_4.npy,3
+data/pose_sequences/cow_7.npy,2
+```
+
+Save as e.g. `data/lameness_labels.csv`.
+
+### Step 3 — Train the lameness model
+
+```bash
+cowculator train-lameness -- --csv data/lameness_labels.csv --epochs 100 --seq-len 60
+```
+
+Key options:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--seq-len N` | 60 | Frames per sequence window (~2 s at 30 fps) |
+| `--hidden N` | 128 | GRU hidden units per direction |
+| `--layers N` | 2 | Number of GRU layers |
+| `--dropout F` | 0.3 | Dropout probability |
+| `--regression` | off | Use MSE regression instead of 5-class softmax |
+| `--lr F` | 1e-3 | AdamW learning rate |
+| `--batch-size N` | 16 | Batch size |
+| `--device D` | auto | GPU index or `cpu` |
+| `--workers N` | 0 | DataLoader workers (0 is safe on Windows) |
+
+Checkpoints are saved to `runs/lameness/expN/weights/best.pt`.
+
+### Step 4 — Infer on new sequences
+
+```bash
+cowculator infer-lameness -- --sequences-dir data/pose_sequences/ --out results/lameness.csv
+```
+
+Provide an explicit checkpoint with `--model`:
+
+```bash
+cowculator infer-lameness -- --sequences-dir data/pose_sequences/ --model runs/lameness/exp1/weights/best.pt --out results/lameness.csv
+```
+
+Output CSV columns: `sequence_path, predicted_score, confidence`.
+
+`confidence` is the softmax probability of the top class (classification mode)
+or `NaN` in regression mode.
 
 ## Troubleshooting
 
