@@ -15,7 +15,8 @@ Each ``.npy`` file must contain a float32 array of shape ``[T, K, 3]`` where:
 - 3  = (normalised x, normalised y, confidence)
 
 The dataset pads or truncates every sequence to a fixed ``seq_len`` and
-returns a flat tensor of shape ``[seq_len, K*3]``.
+returns a flat tensor of shape ``[seq_len, K*3]`` (or ``[seq_len, K*3 + F]``
+when a ``feature_fn`` is supplied — see ``gait_features.py``).
 """
 from __future__ import annotations
 
@@ -87,6 +88,35 @@ def augment_horizontal_flip(arr: np.ndarray) -> np.ndarray:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Normalization
+# ──────────────────────────────────────────────────────────────────────────────
+
+def normalize_sequence(arr: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    """Per-sequence z-score normalization over the temporal dimension.
+
+    Normalizes each of the K*3 channels independently using the mean and
+    standard deviation computed across the T frames of that sequence.  This
+    corrects for variation in camera placement and cow size so the GRU sees
+    consistent input magnitudes regardless of absolute keypoint positions.
+
+    Parameters
+    ----------
+    arr : float32 array of shape ``[T, K, 3]``.
+    eps : Small constant added to std to prevent division by zero.
+
+    Returns
+    -------
+    Normalized float32 array of the same shape.
+    """
+    # Reshape to [T, K*3] for channel-wise stats, then restore
+    T, K, C = arr.shape
+    flat = arr.reshape(T, -1)                           # [T, K*3]
+    mean = flat.mean(axis=0, keepdims=True)             # [1, K*3]
+    std = flat.std(axis=0, keepdims=True) + eps         # [1, K*3]
+    return ((flat - mean) / std).reshape(T, K, C).astype(np.float32)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Dataset
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -95,10 +125,18 @@ class GaitSequenceDataset(Dataset):
 
     Parameters
     ----------
-    csv_path  : Path to the label CSV (``sequence_path``, ``lameness_score``).
-    seq_len   : Fixed temporal window length.  Sequences are truncated (taking
-                the last frames) or zero-padded at the start to match.
-    augment   : If True, apply temporal jitter and random horizontal flip.
+    csv_path    : Path to the label CSV (``sequence_path``, ``lameness_score``).
+    seq_len     : Fixed temporal window length.  Sequences are truncated (taking
+                  the last frames) or zero-padded at the start to match.
+    augment     : If True, apply temporal jitter and random horizontal flip.
+    normalize   : If True, apply per-sequence z-score normalization across
+                  the keypoint channels before flattening.  This stabilizes
+                  GRU training when keypoint coordinate distributions vary
+                  across cows or camera placements.
+    feature_fn  : Optional callable ``(arr: [T, K, 3]) -> [T, F]`` that
+                  appends derived gait features (spine angle, hip drop, etc.)
+                  to the flat keypoint vector.  Build one with
+                  ``gait_features.build_feature_fn()``.
     """
 
     def __init__(
@@ -106,11 +144,15 @@ class GaitSequenceDataset(Dataset):
         csv_path: Path,
         seq_len: int = DEFAULT_SEQ_LEN,
         augment: bool = False,
+        normalize: bool = False,
+        feature_fn: Callable | None = None,
     ) -> None:
         self.csv_path = Path(csv_path)
         self.csv_dir = self.csv_path.parent
         self.seq_len = seq_len
         self.augment = augment
+        self.normalize = normalize
+        self.feature_fn = feature_fn
         self.samples: list[tuple[Path, int]] = []
         self._load(self.csv_path)
         # Infer K from first sample for downstream use
@@ -158,8 +200,19 @@ class GaitSequenceDataset(Dataset):
                 arr = augment_horizontal_flip(arr)
 
         arr = _pad_or_truncate(arr, self.seq_len)  # [seq_len, K, 3]
-        # Flatten keypoints: [seq_len, K*3]
-        seq_tensor = torch.from_numpy(arr.reshape(self.seq_len, -1))
+
+        if self.normalize:
+            arr = normalize_sequence(arr)
+
+        # Optional derived feature columns: [seq_len, F]
+        if self.feature_fn is not None:
+            extra = self.feature_fn(arr)  # [seq_len, F]
+            flat_kp = arr.reshape(self.seq_len, -1)           # [seq_len, K*3]
+            flat = np.concatenate([flat_kp, extra], axis=1)  # [seq_len, K*3+F]
+        else:
+            flat = arr.reshape(self.seq_len, -1)  # [seq_len, K*3]
+
+        seq_tensor = torch.from_numpy(flat)
         # Class label: 0-indexed (score 1 → class 0)
         label = torch.tensor(score - LAMENESS_MIN, dtype=torch.long)
         return seq_tensor, label
@@ -171,17 +224,35 @@ class GaitSequenceDataset(Dataset):
 
     @property
     def input_size(self) -> int:
-        """Flattened feature size per timestep: K * 3."""
-        return self.num_keypoints * 3
+        """Flattened feature size per timestep: K*3 (+ F derived features if feature_fn set)."""
+        base = self.num_keypoints * 3
+        if self.feature_fn is not None:
+            extra_f = getattr(self.feature_fn, "num_features", 0)
+            return base + extra_f
+        return base
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Weighted sampler
 # ──────────────────────────────────────────────────────────────────────────────
 
-def build_weighted_sampler(dataset: GaitSequenceDataset) -> WeightedRandomSampler:
-    """Return a WeightedRandomSampler that up-samples rare lameness classes."""
-    scores = dataset.scores
+def build_weighted_sampler(
+    dataset: "GaitSequenceDataset | Subset",
+) -> WeightedRandomSampler:
+    """Return a WeightedRandomSampler that up-samples rare lameness classes.
+
+    Accepts either a full ``GaitSequenceDataset`` or a ``Subset`` of one so
+    that the sampler can be scoped to the training split without requiring a
+    separate dataset construction.
+    """
+    if isinstance(dataset, Subset):
+        base: GaitSequenceDataset = dataset.dataset  # type: ignore[assignment]
+        indices: list[int] = list(dataset.indices)
+        all_scores = base.scores
+        scores = [all_scores[i] for i in indices]
+    else:
+        scores = dataset.scores
+
     class_counts: dict[int, int] = {}
     for s in scores:
         class_counts[s] = class_counts.get(s, 0) + 1
