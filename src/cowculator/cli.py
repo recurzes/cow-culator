@@ -75,6 +75,24 @@ def _cmd_pose_track(args: argparse.Namespace) -> None:
     pt_main(_passthrough_argv(list(args.remainder)))
 
 
+def _cmd_select_bcs_frames(args: argparse.Namespace) -> None:
+    from cowculator.bcs_frame_selector import main as sbf_main
+
+    sbf_main(_passthrough_argv(list(args.remainder)))
+
+
+def _cmd_train_bcs(args: argparse.Namespace) -> None:
+    from cowculator.train_bcs import main as tb_main
+
+    tb_main(_passthrough_argv(list(args.remainder)))
+
+
+def _cmd_infer_bcs(args: argparse.Namespace) -> None:
+    from cowculator.infer_bcs import main as ib_main
+
+    ib_main(_passthrough_argv(list(args.remainder)))
+
+
 def _cmd_doctor(_: argparse.Namespace) -> None:
     root = repo_root()
     ds = root / "yolo_dataset" / "dataset.yaml"
@@ -146,6 +164,39 @@ def build_parser() -> argparse.ArgumentParser:
         help="Arguments for pose_track",
     )
     s.set_defaults(_handler=_cmd_pose_track)
+
+    s = sub.add_parser(
+        "select-bcs-frames",
+        help="Copy last-N frames per cow track as back-view BCS candidates (pass-through args)",
+    )
+    s.add_argument(
+        "remainder",
+        nargs=argparse.REMAINDER,
+        help="Arguments for bcs_frame_selector (e.g. --crops-dir data/tracked_cows --last-n 5)",
+    )
+    s.set_defaults(_handler=_cmd_select_bcs_frames)
+
+    s = sub.add_parser(
+        "train-bcs",
+        help="Train EfficientNet-B0 BCS regression model (pass-through args)",
+    )
+    s.add_argument(
+        "remainder",
+        nargs=argparse.REMAINDER,
+        help="Arguments for train_bcs (e.g. --csv data/bcs_labels.csv --epochs 100)",
+    )
+    s.set_defaults(_handler=_cmd_train_bcs)
+
+    s = sub.add_parser(
+        "infer-bcs",
+        help="Predict BCS scores from back-view images (pass-through args)",
+    )
+    s.add_argument(
+        "remainder",
+        nargs=argparse.REMAINDER,
+        help="Arguments for infer_bcs (e.g. --images data/bcs_frames/ --out results.csv)",
+    )
+    s.set_defaults(_handler=_cmd_infer_bcs)
 
     s = sub.add_parser("doctor", help="Print resolved default paths and env")
     s.set_defaults(_handler=_cmd_doctor)
