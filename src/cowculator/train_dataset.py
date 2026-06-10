@@ -15,6 +15,11 @@ from cowculator.paths import (
     default_labels_dir,
     repo_root,
 )
+from cowculator.pose_labels import (
+    EXPECTED_KEYPOINTS,
+    KPT_DIM,
+    filter_pose_label_lines,
+)
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
@@ -49,52 +54,14 @@ def _unique_image_name(
     return name
 
 
-def _parse_pose_line(line: str) -> int:
-    """Return keypoint count K for one YOLO pose line (5 + K*3 tokens)."""
-    tokens = line.strip().split()
-    if not tokens:
-        return -1
-    n = len(tokens)
-    if n < 5:
-        raise ValueError(f"Pose line needs at least 5 values, got {n}: {line!r}")
-    rest = n - 5
-    if rest % 3 != 0:
-        raise ValueError(
-            f"Expected 5 + 3*K tokens, got {n} (remainder {(n - 5) % 3}): {line!r}"
-        )
-    return rest // 3
-
-
-def _validate_label_file(path: Path, expected_k: int) -> None:
-    with open(path, encoding="utf-8") as f:
-        for i, line in enumerate(f, start=1):
-            s = line.strip()
-            if not s:
-                continue
-            k = _parse_pose_line(s)
-            if k != expected_k:
-                raise ValueError(
-                    f"{path}: line {i} has {k} keypoints, expected {expected_k}"
-                )
-
-
-def _infer_kpt_shape_from_labels(label_paths: list[Path]) -> tuple[int, int]:
-    if not label_paths:
-        raise ValueError("No label files to infer kpt_shape")
-    ks: set[int] = set()
-    for lp in label_paths:
-        with open(lp, encoding="utf-8") as f:
-            for line in f:
-                s = line.strip()
-                if s:
-                    ks.add(_parse_pose_line(s))
-                    break
-            else:
-                raise ValueError(f"{lp}: no non-empty lines")
-    if len(ks) != 1:
-        raise ValueError(f"Inconsistent keypoint counts across files: {sorted(ks)}")
-    k = ks.pop()
-    return k, 3
+def _print_label_issues(issues: list[str], *, limit: int = 40) -> None:
+    if not issues:
+        return
+    print(f"  dropped label lines (not {EXPECTED_KEYPOINTS} keypoints): {len(issues)}")
+    for msg in issues[:limit]:
+        print(f"    {msg}")
+    if len(issues) > limit:
+        print(f"    ... and {len(issues) - limit} more")
 
 
 def prepare(
@@ -119,32 +86,30 @@ def prepare(
         k for k, c in Counter(p.name.lower() for p in images).items() if c > 1
     }
 
-    paired: list[tuple[Path, Path, str]] = []
+    paired: list[tuple[Path, Path, str, list[str]]] = []
     skipped_no_label: list[Path] = []
+    dropped_label_issues: list[str] = []
     for p in images:
         uniq = _unique_image_name(p, annotations_dir, dup_lower)
         label_path = labels_dir / f"{p.stem}.txt"
         if not label_path.is_file():
             skipped_no_label.append(p)
             continue
-        with open(label_path, encoding="utf-8") as f:
-            content = f.read().strip()
-        if not content:
+        valid_lines, issues = filter_pose_label_lines(label_path)
+        dropped_label_issues.extend(issues)
+        if not valid_lines:
             skipped_no_label.append(p)
             continue
-        paired.append((p, label_path, uniq))
+        paired.append((p, label_path, uniq, valid_lines))
 
     all_label_txts = sorted(labels_dir.glob("*.txt"))
-    used_label_stems = {pl.stem for _, pl, _ in paired}
+    used_label_stems = {pl.stem for _, pl, _, _ in paired}
     orphan_labels = [p for p in all_label_txts if p.stem not in used_label_stems]
 
     if not paired:
         raise SystemExit("No image+label pairs found. Check paths and naming.")
 
-    label_paths = [pl for _, pl, _ in paired]
-    k, dim = _infer_kpt_shape_from_labels(label_paths)
-    for _, pl, _ in paired:
-        _validate_label_file(pl, k)
+    k, dim = EXPECTED_KEYPOINTS, KPT_DIM
 
     rng = random.Random(seed)
     rng.shuffle(paired)
@@ -160,20 +125,19 @@ def prepare(
     for sub in ("images/train", "images/val", "labels/train", "labels/val"):
         (out_root / sub).mkdir(parents=True, exist_ok=True)
 
-    def install(split: str, items: list[tuple[Path, Path, str]]) -> None:
-        for img_path, lbl_path, uniq in items:
+    def install(split: str, items: list[tuple[Path, Path, str, list[str]]]) -> None:
+        for img_path, _lbl_path, uniq, valid_lines in items:
             dst_img = out_root / "images" / split / uniq
             dst_lbl = out_root / "labels" / split / f"{Path(uniq).stem}.txt"
             if use_symlinks:
                 if dst_img.exists() or dst_img.is_symlink():
                     dst_img.unlink()
-                if dst_lbl.exists() or dst_lbl.is_symlink():
-                    dst_lbl.unlink()
                 dst_img.symlink_to(img_path.resolve())
-                dst_lbl.symlink_to(lbl_path.resolve())
             else:
                 shutil.copy2(img_path, dst_img)
-                shutil.copy2(lbl_path, dst_lbl)
+            if dst_lbl.exists() or dst_lbl.is_symlink():
+                dst_lbl.unlink()
+            dst_lbl.write_text("\n".join(valid_lines) + "\n", encoding="utf-8")
 
     install("train", train_set)
     if val_set:
@@ -209,6 +173,7 @@ kpt_shape: [{k}, {dim}]
         print(f"  images w/o label or empty txt: {len(skipped_no_label)}")
     if orphan_labels:
         print(f"  orphan labels (no matching image): {len(orphan_labels)}")
+    _print_label_issues(dropped_label_issues)
     return yaml_path
 
 
