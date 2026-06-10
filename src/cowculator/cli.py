@@ -34,15 +34,14 @@ def _cmd_extract_frames(args: argparse.Namespace) -> None:
 def _cmd_xml_to_yolo(args: argparse.Namespace) -> None:
     from cowculator.xml_to_yolo import main as x2y_main
 
-    x2y_main(
-        [
-            "--xml",
-            str(args.xml),
-            "--labels-out",
-            str(args.labels_out),
-        ]
-        + (["--overwrite"] if args.overwrite else [])
-    )
+    argv: list[str] = ["--labels-out", str(args.labels_out)]
+    if args.xml is not None:
+        argv.extend(["--xml", str(args.xml)])
+    else:
+        argv.extend(["--xml-dir", str(args.xml_dir)])
+    if args.overwrite:
+        argv.append("--overwrite")
+    x2y_main(argv)
 
 
 def _cmd_prepare(args: argparse.Namespace) -> None:
@@ -131,7 +130,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(_handler=_cmd_extract_frames)
 
     s = sub.add_parser("xml-to-yolo", help="CVAT XML for Images 1.1 → YOLO pose .txt")
-    s.add_argument("--xml", type=Path, required=True)
+    src = s.add_mutually_exclusive_group(required=True)
+    src.add_argument("--xml", type=Path, help="Single CVAT annotations.xml")
+    src.add_argument(
+        "--xml-dir",
+        type=Path,
+        help="Directory of CVAT .xml files (all *.xml, non-recursive)",
+    )
     s.add_argument("--labels-out", type=Path, required=True)
     s.add_argument("--overwrite", action="store_true")
     s.set_defaults(_handler=_cmd_xml_to_yolo)
